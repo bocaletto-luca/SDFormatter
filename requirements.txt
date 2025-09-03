@@ -1,0 +1,9 @@
+# Core dependency for the GUI version
+PySide6>=6.6.0
+
+# No extra packages are strictly required for the terminal versions,
+# but you can pin Python version compatibility if desired.
+# The scripts use only the Python standard library and PowerShell.
+
+# Optional: packaging tool if you want to build an executable
+pyinstaller>=6.0.0

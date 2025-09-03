@@ -101,7 +101,7 @@ python sdFormatterTerminal-italian.py
 
 ## License
 
-This project is released under the MIT License. See [LICENSE](LICENSE) for details.
+This project is released under the GPL v3 License. See [LICENSE](LICENSE) for details.
 
 ---
 

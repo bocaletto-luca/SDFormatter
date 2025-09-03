@@ -7,7 +7,7 @@ import shutil
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 
-from PySide6.QtCore import Qt, QThread, Signal, QSize
+from PySide6.QtCore import Qt, QThread, Signal
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
     QTableWidget, QTableWidgetItem, QLabel, QLineEdit, QComboBox, QCheckBox,
@@ -44,7 +44,6 @@ def relaunch_as_admin():
         QMessageBox.critical(None, "Elevazione fallita", f"Non riesco a elevare i privilegi: {e}")
 
 def run_powershell(ps_command: str) -> subprocess.CompletedProcess:
-    # Usa powershell.exe in modalità silenziosa
     exe = shutil.which("powershell") or shutil.which("powershell.exe")
     if not exe:
         raise RuntimeError("PowerShell non trovato nel PATH.")
@@ -65,7 +64,6 @@ def run_powershell_json(ps_command: str) -> Any:
     except json.JSONDecodeError as e:
         raise RuntimeError(f"JSON non valido da PowerShell: {e}\nOutput: {text[:1000]}")
 
-
 def bytes_human(n: int) -> str:
     step = 1024.0
     units = ["B", "KB", "MB", "GB", "TB", "PB"]
@@ -77,7 +75,6 @@ def bytes_human(n: int) -> str:
     return f"{size:.1f} PB"
 
 def cluster_bytes_from_label(label: str) -> Optional[int]:
-    # label es: "Auto", "4 KB", "16 KB", ... "1024 KB"
     if label.lower().startswith("auto"):
         return None
     num = label.split()[0]
@@ -106,7 +103,6 @@ class DiskInfo:
 def list_disks() -> List[DiskInfo]:
     if not is_windows():
         raise RuntimeError("Questa app supporta solo Windows.")
-    # PowerShell: raccoglie dischi e lettere montate
     ps = r"""
 $disks = Get-Disk | Select-Object Number, Size, BusType, FriendlyName, IsSystem, IsBoot, IsReadOnly, PartitionStyle
 $result = @()
@@ -134,7 +130,6 @@ $result | ConvertTo-Json -Depth 4
     data = run_powershell_json(ps)
     if data is None:
         return []
-    # Normalizza array vs oggetto singolo
     if isinstance(data, dict):
         data = [data]
     disks: List[DiskInfo] = []
@@ -158,11 +153,10 @@ $result | ConvertTo-Json -Depth 4
 # =========================
 
 class FormatWorker(QThread):
-    progress = Signal(str)        # messaggi
-    step = Signal(int)            # 0..100
-    finished = Signal(dict)       # risultato finale
-    failed = Signal(str)          # errore
-    confirm_needed = Signal(str)  # eventuali prompt
+    progress = Signal(str)
+    step = Signal(int)
+    finished = Signal(dict)
+    failed = Signal(str)
 
     def __init__(self, args: Dict[str, Any]):
         super().__init__()
@@ -197,9 +191,7 @@ class FormatWorker(QThread):
         cam_compat: bool = bool(self.args.get("cam_compat", False))
         cluster_label: str = self.args.get("cluster_label", "Auto")
 
-        # Determina FS se AUTO e cluster
-        # Ottiene dimensione disco per dedurre AUTO
-        size_bytes = None
+        # Determina dimensione e regole AUTO
         try:
             size_bytes = next((d.size for d in list_disks() if d.number == disk), None)
         except Exception:
@@ -211,24 +203,23 @@ class FormatWorker(QThread):
             else:
                 fs = "exFAT"
 
-        # Compat fotocamere forza FAT32 + 32KB se possibile
         if cam_compat:
             if size_bytes is not None and size_bytes <= 32 * 1024**3:
                 fs = "FAT32"
-            # cluster 32KB preferito per molte fotocamere
             cluster_bytes = 32 * 1024
         else:
             cluster_bytes = cluster_bytes_from_label(cluster_label)
 
-        # Vincoli di sicurezza: vieta FAT32 > 32GB
         if fs == "FAT32" and (size_bytes is None or size_bytes > 32 * 1024**3):
             raise RuntimeError("FAT32 selezionato ma la capacità supera 32 GB. Usa exFAT o AUTO.")
 
-        # Step 0: riepilogo
-        self._emit(f"Disco #{disk} — FS: {fs}, Etichetta: '{label}', Quick: {quick}, Pulizia profonda: {deep_clean}, Dry-run: {dry_run}", 0)
+        self._emit(
+            f"Disco #{disk} — FS: {fs}, Etichetta: '{label}', Quick: {quick}, "
+            f"Pulizia profonda: {deep_clean}, Dry-run: {dry_run}", 0
+        )
         self._check_cancel()
 
-        # Step 1: sblocca disco (online/lettura-scrittura)
+        # Step 1: online e scrivibile
         self._emit("Verifica e sblocco disco...", 10)
         if not dry_run:
             ps1 = f"Set-Disk -Number {disk} -IsOffline $false -IsReadOnly $false -ErrorAction Stop"
@@ -254,7 +245,7 @@ class FormatWorker(QThread):
                     raise RuntimeError(cp.stderr.strip() or "Errore in Clear-Disk.")
         self._check_cancel()
 
-        # Step 3: inizializzazione MBR (compatibilità massima per SD)
+        # Step 3: inizializzazione MBR
         self._emit("Inizializzazione MBR...", 40)
         if not dry_run:
             ps3 = f"Initialize-Disk -Number {disk} -PartitionStyle MBR -ErrorAction Stop"
@@ -263,7 +254,7 @@ class FormatWorker(QThread):
                 raise RuntimeError(cp.stderr.strip() or "Errore in Initialize-Disk.")
         self._check_cancel()
 
-        # Step 4: nuova partizione e lettera
+        # Step 4: partizione e lettera
         self._emit("Creazione partizione primaria e assegnazione lettera...", 55)
         drive_letter = "X"
         if not dry_run:
@@ -281,7 +272,6 @@ class FormatWorker(QThread):
         # Step 5: format
         self._emit(f"Formattazione {fs} sulla lettera {drive_letter}: ...", 80)
         if not dry_run:
-            # Parametri Format-Volume
             full_flag = "$true" if not quick else "$false"
             label_param = f'-NewFileSystemLabel "{label}"' if label else ""
             aus_param = f"-AllocationUnitSize {cluster_bytes}" if cluster_bytes else ""
@@ -291,7 +281,6 @@ class FormatWorker(QThread):
                 raise RuntimeError(cp.stderr.strip() or "Errore in Format-Volume.")
         self._check_cancel()
 
-        # Step 6: completato
         self._emit("Operazione completata.", 100)
         self.finished.emit({
             "status": "OK",
@@ -312,7 +301,7 @@ class ConfirmDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Conferma formattazione")
         self.setModal(True)
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
 
         layout = QVBoxLayout(self)
 
@@ -360,9 +349,10 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("SD Formatter Pro — GUI")
-        self.resize(980, 680)
+        self.resize(1000, 700)
 
         self.worker: Optional[FormatWorker] = None
+        self._disks: List[DiskInfo] = []
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -387,7 +377,7 @@ class MainWindow(QMainWindow):
         opts = QHBoxLayout()
 
         self.label_edit = QLineEdit()
-        self.label_edit.setPlaceholderText("Etichetta volume")
+        self.label_edit.setPlaceholderText("Etichetta volume (opzionale)")
 
         self.fs_combo = QComboBox()
         self.fs_combo.addItems(["AUTO", "FAT32", "exFAT", "NTFS"])
@@ -400,6 +390,7 @@ class MainWindow(QMainWindow):
 
         self.cluster_combo = QComboBox()
         self.cluster_combo.addItems(["Auto", "4 KB", "8 KB", "16 KB", "32 KB", "64 KB", "128 KB", "256 KB", "512 KB", "1024 KB"])
+        self.cluster_combo.setCurrentText("Auto")
 
         self.dry_run_check = QCheckBox("Modalità prova (dry-run)")
         self.dry_run_check.setChecked(True)
@@ -451,6 +442,8 @@ class MainWindow(QMainWindow):
         self.update_admin_banner()
         self.load_disks()
 
+    # -------- Stato UI
+
     def update_admin_banner(self):
         if not is_windows():
             self.admin_banner.setText("Questa applicazione funziona solo su Windows.")
@@ -464,13 +457,180 @@ class MainWindow(QMainWindow):
             self.admin_banner.setText("Privilegi amministrativi mancanti. Per formattare è necessario riavviare come amministratore.")
             self.elevate_btn.setEnabled(True)
 
+    def set_busy(self, busy: bool):
+        self.refresh_btn.setEnabled(not busy)
+        self.format_btn.setEnabled(not busy)
+        self.cancel_btn.setEnabled(busy)
+        self.elevate_btn.setEnabled(not busy)
+        self.table.setEnabled(not busy)
+
+    # -------- Dischi
+
+    def load_disks(self):
+        try:
+            self._disks = list_disks()
+        except Exception as e:
+            QMessageBox.critical(self, "Errore", str(e))
+            self._disks = []
+
+        self.table.setRowCount(0)
+        for d in self._disks:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            self.table.setItem(row, 0, QTableWidgetItem(str(d.number)))
+            self.table.setItem(row, 1, QTableWidgetItem(bytes_human(d.size)))
+            self.table.setItem(row, 2, QTableWidgetItem(d.bus_type))
+            self.table.setItem(row, 3, QTableWidgetItem(d.friendly_name))
+            self.table.setItem(row, 4, QTableWidgetItem(",".join(str(x) for x in d.letters)))
+            self.table.setItem(row, 5, QTableWidgetItem("Sì" if d.is_system else "No"))
+            self.table.setItem(row, 6, QTableWidgetItem("Sì" if d.is_boot else "No"))
+            self.table.setItem(row, 7, QTableWidgetItem("Sì" if d.is_readonly else "No"))
+
+            if d.is_system or d.is_boot or d.is_readonly:
+                for c in range(self.table.columnCount()):
+                    item = self.table.item(row, c)
+                    if item:
+                        item.setFlags(item.flags() & ~Qt.ItemIsSelectable)
+                        item.setForeground(Qt.gray)
+
+        self.table.resizeColumnsToContents()
+
+    def selected_disk(self) -> Optional[DiskInfo]:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._disks):
+            return None
+        return self._disks[row]
+
+    # -------- Opzioni/UX
+
     def on_fs_changed(self):
-        # Se selezioni NTFS e compat fotocamere, disabilita flag
-        if self.fs_combo.currentText().upper() == "NTFS":
+        fs = self.fs_combo.currentText().upper()
+        if fs == "NTFS":
             self.cam_check.setChecked(False)
             self.cam_check.setEnabled(False)
         else:
             self.cam_check.setEnabled(True)
 
     def on_cam_changed(self):
-        # Se compat fotocamere, forza cluster 32 KB in UI (
+        if self.cam_check.isChecked():
+            self.cluster_combo.setCurrentText("32 KB")
+            self.cluster_combo.setEnabled(False)
+        else:
+            self.cluster_combo.setEnabled(True)
+
+    # -------- Azioni
+
+    def on_format(self):
+        if not is_admin():
+            res = QMessageBox.question(
+                self, "Privilegi richiesti",
+                "Per formattare sono necessari privilegi amministrativi. Vuoi riavviare ora come amministratore?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if res == QMessageBox.Yes:
+                relaunch_as_admin()
+            return
+
+        d = self.selected_disk()
+        if not d:
+            QMessageBox.warning(self, "Nessun disco", "Seleziona un disco dalla tabella.")
+            return
+        if d.is_system or d.is_boot:
+            QMessageBox.critical(self, "Bloccato", "Non è consentito formattare dischi di sistema o di boot.")
+            return
+        if d.is_readonly:
+            QMessageBox.critical(self, "Sola lettura", "Il disco risulta in sola lettura. Rimuovi la protezione e riprova.")
+            return
+
+        label = self.label_edit.text().strip()
+        fs = self.fs_combo.currentText().upper()
+        quick = self.quick_check.isChecked()
+        deep_clean = self.deep_clean_check.isChecked()
+        cam_compat = self.cam_check.isChecked()
+        cluster_label = self.cluster_combo.currentText()
+        dry_run = self.dry_run_check.isChecked()
+
+        if fs == "FAT32" and d.size > 32 * 1024**3:
+            QMessageBox.warning(self, "Limite FAT32", "FAT32 supportato fino a circa 32 GB. Seleziona exFAT o AUTO.")
+            return
+
+        summary = (
+            f"Stai per formattare il disco #{d.number}\n"
+            f"- Capacità: {bytes_human(d.size)}\n"
+            f"- Bus: {d.bus_type}\n"
+            f"- Nome: {d.friendly_name}\n"
+            f"- File system: {fs}\n"
+            f"- Etichetta: '{label}'\n"
+            f"- Quick: {quick}\n"
+            f"- Pulizia profonda: {deep_clean}\n"
+            f"- Compatibilità fotocamere: {cam_compat}\n"
+            f"- Cluster: {cluster_label}\n"
+            f"- Modalità prova (dry-run): {dry_run}\n\n"
+            "ATTENZIONE: tutti i dati sul disco verranno eliminati."
+        )
+        dlg = ConfirmDialog(self, d.number, summary)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        args = {
+            "disk": d.number,
+            "label": label,
+            "fs": fs,
+            "quick": quick,
+            "deep_clean": deep_clean,
+            "cam_compat": cam_compat,
+            "cluster_label": cluster_label,
+            "dry_run": dry_run
+        }
+
+        self.log.clear()
+        self.progress.setValue(0)
+        self.set_busy(True)
+
+        self.worker = FormatWorker(args)
+        self.worker.progress.connect(self.on_progress)
+        self.worker.step.connect(self.progress.setValue)
+        self.worker.finished.connect(self.on_finished)
+        self.worker.failed.connect(self.on_failed)
+        self.worker.start()
+
+    def on_cancel(self):
+        if self.worker and self.worker.isRunning():
+            self.worker.cancel()
+            self.cancel_btn.setEnabled(False)
+            self.log.append("Richiesta di annullamento inviata...")
+
+    # -------- Callback worker
+
+    def on_progress(self, msg: str):
+        self.log.append(msg)
+
+    def on_finished(self, result: Dict[str, Any]):
+        self.set_busy(False)
+        self.progress.setValue(100)
+        self.log.append(f"Completato: {json.dumps(result, ensure_ascii=False)}")
+        if result.get("status") == "OK":
+            dry = result.get("dry_run", False)
+            if dry:
+                QMessageBox.information(self, "Simulazione completata", "Dry-run concluso con successo. Disattiva la modalità prova per formattare realmente.")
+            else:
+                QMessageBox.information(self, "Successo", "Formattazione completata.")
+            self.load_disks()
+        else:
+            QMessageBox.critical(self, "Errore", f"Operazione non riuscita:\n{result}")
+
+    def on_failed(self, err: str):
+        self.set_busy(False)
+        self.log.append(f"Errore: {err}")
+        QMessageBox.critical(self, "Errore", err)
+
+
+# =========================
+# Avvio applicazione
+# =========================
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
